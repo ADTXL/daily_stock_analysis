@@ -29,14 +29,14 @@ def test_bulk_endpoints_filter_target_before_stopping_period_fallback(monkeypatc
     def forecast(date):
         calls.append(("forecast", date))
         code = "000001" if date == "20260630" else "600519"
-        return pd.DataFrame({"股票代码": [code], "预告": ["目标预告"]})
+        return pd.DataFrame({"股票代码": [code], "业绩变动": ["目标预告"]})
 
     def quick(date):
         calls.append(("quick", date))
         # A nonempty market table without a code cannot establish stock identity.
         if date == "20260630":
-            return pd.DataFrame({"快报": ["未知股票"]})
-        return pd.DataFrame({"股票代码": ["600519"], "快报": ["目标快报"]})
+            return pd.DataFrame({"每股收益": [1.2]})
+        return pd.DataFrame({"股票代码": ["600519"], "每股收益": [1.2]})
 
     def institution(symbol):
         calls.append(("institution", symbol))
@@ -60,7 +60,7 @@ def test_bulk_endpoints_filter_target_before_stopping_period_fallback(monkeypatc
 
     assert result["errors"] == ["stock_yjkb_em:ValueError"]
     assert result["earnings"]["forecast_summary"] == "目标预告"
-    assert result["earnings"]["quick_report_summary"] == "目标快报"
+    assert result["earnings"]["quick_report_summary"] == "每股收益1.2元"
     assert result["institution"] == {
         "institution_holding_change": 3.0, "top10_holder_change": 100.0,
     }
@@ -139,3 +139,98 @@ def test_installed_akshare_receives_valid_parameters_at_http_boundary(monkeypatc
     assert [(params["reportdate"], params["quarter"]) for params in institution_calls] == [
         ("2026", "2"), ("2026", "1"),
     ]
+
+
+def _quick_report_row():
+    # Full returned-column contract from AkShare 1.18.97 stock_yjkb_em.
+    # Metadata precedes metrics to catch column-order-dependent extraction.
+    return {
+        "公告日期": datetime(2026, 7, 20).date(), "序号": 1,
+        "股票代码": "600519", "股票简称": "贵州茅台", "所处行业": "酿酒行业",
+        "每股收益": 1.25, "营业收入-营业收入": 120000000.0,
+        "营业收入-去年同期": 100000000.0, "营业收入-同比增长": 20.0,
+        "营业收入-季度环比增长": 2.0, "净利润-净利润": -5000000.0,
+        "净利润-去年同期": 5000000.0, "净利润-同比增长": -200.0,
+        "净利润-季度环比增长": -50.0, "每股净资产": 5.0, "净资产收益率": -3.5,
+    }
+
+
+@pytest.mark.parametrize("reverse_columns", [False, True])
+def test_real_quick_report_columns_reach_context_cache_and_agent(monkeypatch, reverse_columns):
+    from data_provider.base import DataFetcherManager
+    from src.agent.tools.data_tools import _compact_fundamental_context
+
+    row = _quick_report_row()
+    if reverse_columns:
+        row = dict(reversed(list(row.items())))
+    calls = []
+
+    def quick(date):
+        calls.append(date)
+        other = {**row, "股票代码": "000001", "每股收益": 999.0}
+        return pd.DataFrame([other, row])
+
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(stock_yjkb_em=quick))
+    manager = DataFetcherManager(fetchers=[])
+    cfg = SimpleNamespace(
+        enable_fundamental_pipeline=True, fundamental_cache_ttl_seconds=120,
+        fundamental_stage_timeout_seconds=5.0, fundamental_fetch_timeout_seconds=2.0,
+        fundamental_retry_max=1,
+    )
+    monkeypatch.setattr("src.config.get_config", lambda: cfg)
+    monkeypatch.setattr(manager, "get_realtime_quote", lambda code: None)
+    for method in ("get_capital_flow_context", "get_dragon_tiger_context", "get_board_context"):
+        monkeypatch.setattr(manager, method, lambda *args, **kwargs: {
+            "status": "not_supported", "data": {}, "source_chain": [], "errors": [],
+        })
+
+    # Do not mock the adapter, extraction, manager aggregation, or cache.
+    context = manager.get_fundamental_context("600519")
+    expected = (
+        "营业收入120000000元；营收同比20%；净利润-5000000元；"
+        "净利润同比-200%；每股收益1.25元；净资产收益率-3.5%"
+    )
+    assert context["earnings"]["data"] == {"quick_report_summary": expected}
+    assert context["coverage"]["earnings"] == "ok"
+    cached = manager.get_fundamental_context("600519")
+    assert cached == context
+    assert len(calls) == 1
+    assert _compact_fundamental_context(cached)["earnings"]["data"] == {
+        "quick_report_summary": expected,
+    }
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, None), (float("nan"), None), (float("inf"), None),
+    (pd.NA, None), ("-", None), (0, "每股收益0元"),
+])
+def test_quick_report_metadata_and_missing_metrics_are_not_earnings(monkeypatch, value, expected):
+    from data_provider.base import DataFetcherManager
+
+    row = {"股票代码": "600519", "公告日期": datetime(2026, 7, 20).date(), "每股收益": value}
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(
+        stock_yjkb_em=lambda date: pd.DataFrame([row]),
+    ))
+    result = AkshareFundamentalAdapter().get_fundamental_bundle("600519")
+    if expected is None:
+        assert result["earnings"] == {}
+        assert result["source_chain"] == []
+        assert result["status"] == "not_supported"
+        assert DataFetcherManager._infer_block_status(result["earnings"], result["status"]) == "not_supported"
+    else:
+        assert result["earnings"] == {"quick_report_summary": expected}
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("预计净利润增长20%", "预计净利润增长20%"), (None, None), (float("nan"), None),
+])
+def test_forecast_text_does_not_fall_back_to_announcement_or_numeric_change(monkeypatch, text, expected):
+    row = {
+        "股票代码": "600519", "公告日期": datetime(2026, 7, 20).date(),
+        "业绩变动幅度": 20.0, "业绩变动": text,
+    }
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(
+        stock_yjyg_em=lambda date: pd.DataFrame([row]),
+    ))
+    result = AkshareFundamentalAdapter().get_fundamental_bundle("600519")
+    assert result["earnings"] == ({"forecast_summary": expected} if expected else {})

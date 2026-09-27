@@ -9,6 +9,7 @@ endpoint candidates. It should never raise to caller; partial data is allowed.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -179,6 +180,33 @@ def _recent_report_dates(now: Optional[datetime] = None) -> List[str]:
 def _normalize_report_date(value: Any) -> Optional[str]:
     parsed = _safe_datetime(value)
     return parsed.date().isoformat() if parsed else None
+
+
+def _earnings_forecast_summary(row: pd.Series) -> str:
+    """Read disclosure text by exact column, never an announcement date/rate."""
+    for column in ("业绩变动", "业绩变动原因", "预告类型", "预告", "摘要"):
+        value = row.get(column)
+        if isinstance(value, str) and value.strip().lower() not in ("", "-", "nan", "none", "nat", "<na>"):
+            return value.strip()[:200]
+    return ""
+
+
+def _earnings_quick_summary(row: pd.Series) -> str:
+    """Summarize AkShare's numeric quick-report columns, excluding metadata."""
+    fields = (
+        ("营业收入-营业收入", "营业收入", "元"),
+        ("营业收入-同比增长", "营收同比", "%"),
+        ("净利润-净利润", "净利润", "元"),
+        ("净利润-同比增长", "净利润同比", "%"),
+        ("每股收益", "每股收益", "元"),
+        ("净资产收益率", "净资产收益率", "%"),
+    )
+    parts = []
+    for column, label, unit in fields:
+        value = _safe_float(row.get(column))
+        if value is not None and math.isfinite(value):
+            parts.append(f"{label}{value:.12g}{unit}")
+    return "；".join(parts)[:200]
 
 
 def _build_dividend_payload(
@@ -378,10 +406,10 @@ class AkshareFundamentalAdapter:
         if forecast_df is not None:
             row = _extract_latest_row(forecast_df, stock_code)
             if row is not None:
-                result["earnings"]["forecast_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
-                )[:200]
-                result["source_chain"].append(f"earnings_forecast:{forecast_source}")
+                summary = _earnings_forecast_summary(row)
+                if summary:
+                    result["earnings"]["forecast_summary"] = summary
+                    result["source_chain"].append(f"earnings_forecast:{forecast_source}")
 
         # Earnings quick report
         quick_df, quick_source, quick_errors = self._call_df_candidates([
@@ -392,10 +420,10 @@ class AkshareFundamentalAdapter:
         if quick_df is not None:
             row = _extract_latest_row(quick_df, stock_code)
             if row is not None:
-                result["earnings"]["quick_report_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["快报", "摘要", "公告", "说明"])
-                )[:200]
-                result["source_chain"].append(f"earnings_quick:{quick_source}")
+                summary = _earnings_quick_summary(row)
+                if summary:
+                    result["earnings"]["quick_report_summary"] = summary
+                    result["source_chain"].append(f"earnings_quick:{quick_source}")
 
         # Dividend details (cash dividend, pre-tax)
         dividend_df, dividend_source, dividend_errors = self._call_df_candidates([
