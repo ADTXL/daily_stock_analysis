@@ -141,11 +141,15 @@ def _extract_cash_dividend_per_share(row: pd.Series) -> Optional[float]:
     return _parse_dividend_plan_to_per_share(plan_text)
 
 
-def _filter_rows_by_code(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+def _filter_rows_by_code(
+    df: pd.DataFrame, stock_code: str, *, require_code: bool = False,
+) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     code_cols = [c for c in df.columns if any(k in str(c) for k in ("代码", "股票代码", "证券代码", "symbol", "ts_code"))]
     if not code_cols:
+        if require_code:
+            raise ValueError("Market-wide result is missing a stock code column")
         return df
 
     target = _normalize_code(stock_code)
@@ -158,6 +162,18 @@ def _filter_rows_by_code(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         except Exception:
             continue
     return pd.DataFrame()
+
+
+def _recent_report_dates(now: Optional[datetime] = None) -> List[str]:
+    """Bound report-period fallback to the two most recently completed quarters."""
+    now = now or datetime.now()
+    quarter_start = datetime(now.year, (now.month - 1) // 3 * 3 + 1, 1)
+    dates = []
+    for _ in range(2):
+        end = quarter_start - timedelta(days=1)
+        dates.append(end.strftime("%Y%m%d"))
+        quarter_start = datetime(end.year, (end.month - 1) // 3 * 3 + 1, 1)
+    return dates
 
 
 def _normalize_report_date(value: Any) -> Optional[str]:
@@ -267,6 +283,8 @@ class AkshareFundamentalAdapter:
     def _call_df_candidates(
         self,
         candidates: List[Tuple[str, Dict[str, Any]]],
+        *,
+        stock_code: Optional[str] = None,
     ) -> Tuple[Optional[pd.DataFrame], Optional[str], List[str]]:
         errors: List[str] = []
         try:
@@ -282,6 +300,10 @@ class AkshareFundamentalAdapter:
                 df = fn(**kwargs)
                 if isinstance(df, pd.Series):
                     df = df.to_frame().T
+                if isinstance(df, pd.DataFrame) and not df.empty and stock_code is not None:
+                    # Market-wide endpoints must contain the requested stock.
+                    # A nonempty table for other stocks must not stop fallback.
+                    df = _filter_rows_by_code(df, stock_code, require_code=True)
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     return df, func_name, errors
             except Exception as exc:
@@ -301,6 +323,14 @@ class AkshareFundamentalAdapter:
             "source_chain": [],
             "errors": [],
         }
+
+        # Reuse the provider's market mapping after package initialization;
+        # importing it at module scope would cycle through data_provider.base.
+        from .akshare_fetcher import _to_sina_tx_symbol
+
+        shareholder_symbol = _to_sina_tx_symbol(stock_code)
+        stock_code = _normalize_code(stock_code)
+        report_dates = _recent_report_dates()
 
         # Financial indicators
         fin_df, fin_source, fin_errors = self._call_df_candidates([
@@ -341,11 +371,9 @@ class AkshareFundamentalAdapter:
 
         # Earnings forecast
         forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
-            ("stock_yjyg_em", {"symbol": stock_code}),
-            ("stock_yjyg_em", {}),
-            ("stock_yjbb_em", {"symbol": stock_code}),
-            ("stock_yjbb_em", {}),
-        ])
+            ("stock_yjyg_em", {"date": report_date})
+            for report_date in report_dates
+        ], stock_code=stock_code)
         result["errors"].extend(forecast_errors)
         if forecast_df is not None:
             row = _extract_latest_row(forecast_df, stock_code)
@@ -357,9 +385,9 @@ class AkshareFundamentalAdapter:
 
         # Earnings quick report
         quick_df, quick_source, quick_errors = self._call_df_candidates([
-            ("stock_yjkb_em", {"symbol": stock_code}),
-            ("stock_yjkb_em", {}),
-        ])
+            ("stock_yjkb_em", {"date": report_date})
+            for report_date in report_dates
+        ], stock_code=stock_code)
         result["errors"].extend(quick_errors)
         if quick_df is not None:
             row = _extract_latest_row(quick_df, stock_code)
@@ -384,9 +412,11 @@ class AkshareFundamentalAdapter:
 
         # Institution / top shareholders
         inst_df, inst_source, inst_errors = self._call_df_candidates([
-            ("stock_institute_hold", {}),
-            ("stock_institute_recommend", {}),
-        ])
+            ("stock_institute_hold", {
+                "symbol": f"{report_date[:4]}{int(report_date[4:6]) // 3}",
+            })
+            for report_date in report_dates
+        ], stock_code=stock_code)
         result["errors"].extend(inst_errors)
         if inst_df is not None:
             row = _extract_latest_row(inst_df, stock_code)
@@ -396,10 +426,8 @@ class AkshareFundamentalAdapter:
                 result["source_chain"].append(f"institution:{inst_source}")
 
         top10_df, top10_source, top10_errors = self._call_df_candidates([
-            ("stock_gdfx_top_10_em", {"symbol": stock_code}),
-            ("stock_gdfx_top_10_em", {}),
-            ("stock_zh_a_gdhs_detail_em", {"symbol": stock_code}),
-            ("stock_zh_a_gdhs_detail_em", {}),
+            ("stock_gdfx_top_10_em", {"symbol": shareholder_symbol, "date": report_date})
+            for report_date in report_dates
         ])
         result["errors"].extend(top10_errors)
         if top10_df is not None:
