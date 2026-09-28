@@ -111,6 +111,22 @@ def _is_public_bind_host(host: str) -> bool:
     return (host or "").strip().lower() in _PUBLIC_BIND_HOSTS
 
 
+def _parse_env_float(var_name: str, default: float, *, minimum: float) -> float:
+    """Parse a float environment variable with a lower bound."""
+    raw_value = os.getenv(var_name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError:
+        logger.warning("%s=%r 不是有效数字，使用默认值 %.1f", var_name, raw_value, default)
+        return default
+    if value < minimum:
+        logger.warning("%s=%.1f 小于最小值 %.1f，使用默认值 %.1f", var_name, value, minimum, default)
+        return default
+    return value
+
+
 def _warn_if_public_webui_without_auth(host: str) -> None:
     if not _is_public_bind_host(host):
         return
@@ -1341,7 +1357,7 @@ def start_api_server(host: str, port: int, config: Config) -> None:
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
 
-    timeout_seconds = 3.0
+    timeout_seconds = _parse_env_float("FASTAPI_STARTUP_TIMEOUT_SECONDS", 30.0, minimum=0.1)
     wait_deadline = time.time() + timeout_seconds
     while time.time() < wait_deadline:
         if startup_error:

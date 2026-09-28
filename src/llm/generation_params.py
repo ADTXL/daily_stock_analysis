@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -72,6 +73,12 @@ _SECRET_CACHE_FIELD_NAMES = {
     "api-key",
     "openai-api-key",
 }
+
+
+def _get_configured_reasoning_effort() -> Optional[str]:
+    """Return optional LiteLLM/OpenAI reasoning effort from environment."""
+    value = (os.getenv("LITELLM_REASONING_EFFORT") or os.getenv("OPENAI_REASONING_EFFORT") or "").strip()
+    return value or None
 
 
 def _resolve_litellm_model_list_entry(
@@ -429,6 +436,9 @@ def apply_litellm_generation_params(
         updated["temperature"] = directive.temperature
     else:
         updated["temperature"] = default_temperature if temperature is None else float(temperature)
+    reasoning_effort = _get_configured_reasoning_effort()
+    if reasoning_effort and "reasoning_effort" not in updated:
+        updated["reasoning_effort"] = reasoning_effort
     cached_recovery = get_cached_litellm_generation_param_recovery(
         model,
         model_list=model_list,
