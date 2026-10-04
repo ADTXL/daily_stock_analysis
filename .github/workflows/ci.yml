@@ -267,6 +267,10 @@ jobs:
         run: npm run build
       - name: 🌐 Install fixture browser
         run: npx playwright install --with-deps chromium
+      - name: 🧪 Verify default smoke without backend credentials
+        env:
+          DSA_WEB_SMOKE_PASSWORD: ''
+        run: npm run test:smoke
       - name: 📸 Verify deterministic UI fixtures
         run: npx playwright test --config playwright.fixture.config.ts
       - name: 📎 Upload UI evidence
