@@ -93,6 +93,9 @@ class MiaoxiangFetcher(BaseFetcher):
     # 声明该补充源可服务的资金流市场；探测与预算分配据此判断,
     # 避免把仅支持其他市场的同名方法实现(如 FutuFetcher 仅港股)误判为本市场补充源
     capital_flow_markets = {"cn"}
+    # Admission is shared by chip/flow queries and by fresh manager instances.
+    # Never queue another quota-consuming request behind an abandoned worker.
+    _request_lock = threading.Lock()
 
     def __init__(
         self,
@@ -109,8 +112,11 @@ class MiaoxiangFetcher(BaseFetcher):
         self._cache_ttl = float(cache_ttl)
         self._cache: Dict[str, Tuple[float, Any]] = {}
         self._cache_lock = threading.Lock()
-        self._request_lock = threading.Lock()
         self._last_request_ts = 0.0
+
+    def is_available_for_request(self, capability: str = "") -> bool:
+        """Keep this supplement-only provider out of every daily-data route."""
+        return capability != "daily_data"
 
     # ------------------------------------------------------------------
     # MX_API 客户端
@@ -123,7 +129,9 @@ class MiaoxiangFetcher(BaseFetcher):
             if cached and (time.time() - cached[0]) < self._cache_ttl:
                 return cached[1]
 
-        with self._request_lock:
+        if not self._request_lock.acquire(blocking=False):
+            raise DataFetchError("妙想 API 请求仍在执行，跳过本次补充查询")
+        try:
             wait = MX_MIN_REQUEST_INTERVAL_SECONDS - (time.time() - self._last_request_ts)
             if wait > 0:
                 time.sleep(wait)
@@ -140,6 +148,8 @@ class MiaoxiangFetcher(BaseFetcher):
                 raise DataFetchError(f"妙想 API 请求失败: {exc}") from exc
             finally:
                 self._last_request_ts = time.time()
+        finally:
+            self._request_lock.release()
 
         if payload.get("status") != 0:
             message = str(payload.get("message", ""))[:120]
@@ -169,12 +179,18 @@ class MiaoxiangFetcher(BaseFetcher):
         return tables
 
     @staticmethod
-    def _table_rows(table_dto: Dict[str, Any]) -> List[Dict[str, str]]:
-        """把 MX 表格（headName 为行轴 + 指标列数组）转为 [{label: value}] 行列表。"""
-        table = table_dto.get("table") or {}
+    def _table_name_map(table_dto: Dict[str, Any]) -> Dict[str, Any]:
+        """Use the same numeric-key/list mapping for selection and row parsing."""
         name_map = table_dto.get("nameMap") or {}
         if isinstance(name_map, list):
             name_map = {str(i): v for i, v in enumerate(name_map)}
+        return name_map
+
+    @staticmethod
+    def _table_rows(table_dto: Dict[str, Any]) -> List[Dict[str, str]]:
+        """把 MX 表格（headName 为行轴 + 指标列数组）转为 [{label: value}] 行列表。"""
+        table = table_dto.get("table") or {}
+        name_map = MiaoxiangFetcher._table_name_map(table_dto)
         heads = table.get("headName") or []
         rows: List[Dict[str, str]] = []
         for key, values in table.items():
@@ -195,7 +211,7 @@ class MiaoxiangFetcher(BaseFetcher):
     def _table_labels(self, table_dto: Dict[str, Any]) -> List[str]:
         """返回表格包含的全部指标名（经 nameMap 映射）。"""
         table = table_dto.get("table") or {}
-        name_map = table_dto.get("nameMap") or {}
+        name_map = self._table_name_map(table_dto)
         labels: List[str] = []
         for key in table:
             if key == "headName":

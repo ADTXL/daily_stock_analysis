@@ -186,6 +186,8 @@ daily_stock_analysis/
 | `LONGBRIDGE_PRINT_QUOTE_PACKAGES` | 连接时是否打印行情包（未设置时默认 `false`；设为 `1`/`true`/`yes` 开启） | 可选 |
 | `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布（Actions 默认 false；需筹码数据时在 Variables 中设为 true，接口可能不稳定） | 可选 |
 
+妙想筹码/资金流在同一进程内共享网络请求准入锁：进入查询方法时若已有请求未结束，新查询直接跳过，不在此锁上排队。资金流补充的超时隔离保持到实际后台请求退出，其他数据源仍可回退；不取消已经发出的请求，也不改变管理器原有的筹码调用串行化。该补充源通过能力检查排除所有日线请求，并在选表和解析时统一支持字典/列表形式的 `nameMap`。
+
 妙想资金流仅使用明确的主力净流入金额指标；收盘价、占比及缺失金额不会作为资金流回退值。最新交易日金额缺失时保持未知，5/10 日窗口包含缺失金额时不输出合计，不使用更早日期补位。
 
 > **GitHub Actions：** 仓库自带 `00-daily-analysis.yml` 已把 `TUSHARE_TOKEN`、`TICKFLOW_API_KEY` / `TICKFLOW_*` 和上表中的 `LONGBRIDGE_*` 映射到任务环境。TickFlow 的 API Key 建议放在 **Secrets**，优先级、复权和批量开关可放在 **Variables** 或 **Secrets**。Longbridge OAuth 方式需要一个 client_id（优先 `LONGBRIDGE_OAUTH_CLIENT_ID`；留空且无 Legacy Access Token 时使用 `LONGBRIDGE_APP_KEY` 兼容），并把本机 `~/.longbridge/openapi/tokens/<client_id>` 文件 base64 后保存为 Secret `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64`；Legacy 方式仍可配置 `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、`LONGBRIDGE_ACCESS_TOKEN`。可选接入点变量（如 `LONGBRIDGE_REGION`）可放在 **Variables** 或 **Secrets**。

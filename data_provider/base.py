@@ -4595,14 +4595,15 @@ class DataFetcherManager:
                 lambda f=getter: f(stock_code),
                 remaining,
                 "capital_flow_supplement",
+                quarantine_key=(fetcher.name, "capital_flow"),
             )
             remaining = max(0.0, remaining - sup_cost_ms / 1000.0)
+            if isinstance(supplemental, dict) and supplemental.get("errors"):
+                payload.setdefault("errors", []).extend(supplemental["errors"])
             if isinstance(supplemental, dict) and supplemental.get("stock_flow"):
                 payload["stock_flow"] = supplemental["stock_flow"]
                 if supplemental.get("source_chain"):
                     payload.setdefault("source_chain", []).extend(supplemental["source_chain"])
-                if supplemental.get("errors"):
-                    payload.setdefault("errors", []).extend(supplemental["errors"])
                 logger.info(
                     "[资金流] %s 使用 %s 补充个股资金流 (%dms)",
                     stock_code,

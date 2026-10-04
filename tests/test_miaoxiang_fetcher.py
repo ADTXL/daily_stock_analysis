@@ -314,7 +314,7 @@ class TestSupplementMarketDetection:
         budgets = []
         manager = self._captured_budgets(self._bare_manager([fetcher]), budgets)
         # 让补充调用立即失败,聚焦预算断言
-        manager._run_with_timeout = lambda task, t, name: (None, f"{name} timeout", int(t * 1000))
+        manager._run_with_timeout = lambda task, t, name, **kwargs: (None, f"{name} timeout", int(t * 1000))
         manager.get_capital_flow_context("001205", budget_seconds=10.0)
         assert budgets and budgets[0] == ("capital_flow", 6.0)  # 60% 留余量
 
@@ -483,7 +483,7 @@ class TestUnifiedBudgetProbeGate:
                     "source_chain": [], "errors": [], "status": "not_supported"}, None, int(timeout_seconds * 1000)
 
         manager._run_with_retry = fake_run_with_retry
-        manager._run_with_timeout = lambda task, t, name: (None, f"{name} timeout", int(t * 1000))
+        manager._run_with_timeout = lambda task, t, name, **kwargs: (None, f"{name} timeout", int(t * 1000))
         manager.get_capital_flow_context("001205", budget_seconds=10.0)
         assert budgets and budgets[0] == ("capital_flow", 6.0)
 
@@ -507,6 +507,196 @@ class TestConfigSchemaContract:
         assert field.get("data_type") == "integer"
         assert field.get("is_sensitive") is False
         assert field.get("validation", {}).get("min") == 0
+
+
+class TestSupplementRuntimeContracts:
+    @pytest.mark.parametrize("fresh_instances", [False, True])
+    def test_concurrent_burst_does_not_leave_late_quota_requests(self, monkeypatch, fresh_instances):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier, Event, current_thread
+        from types import SimpleNamespace
+
+        barrier, release = Barrier(8), Event()
+        posts = []
+        monkeypatch.setattr("data_provider.miaoxiang_fetcher.MX_MIN_REQUEST_INTERVAL_SECONDS", 0)
+        monkeypatch.setattr("src.config.get_config", lambda: SimpleNamespace(fundamental_retry_max=1))
+        shared = MiaoxiangFetcher(api_key="test-key", cache_ttl=0)
+        managers = [DataFetcherManager(fetchers=[MiaoxiangFetcher(api_key="test-key", cache_ttl=0)
+                                                if fresh_instances else shared]) for _ in range(8)]
+        for manager in managers:
+            manager._fundamental_adapter.get_capital_flow = lambda code: {
+                "status": "not_supported", "stock_flow": {}, "sector_rankings": {}, "errors": [],
+            }
+
+        def blocked_post(*args, **kwargs):
+            posts.append(current_thread())
+            assert release.wait(timeout=5)
+            table = _make_table(["2026-08-21"], {"0": ["100万"]}, {"0": "主力净流入资金"})
+            return _FakeResponse(_make_response([table]))
+
+        def call(index):
+            barrier.wait(timeout=2)
+            return managers[index].get_capital_flow_context(str(600100 + index), budget_seconds=0.15)
+
+        monkeypatch.setattr("data_provider.miaoxiang_fetcher.requests.post", blocked_post)
+        try:
+            with ThreadPoolExecutor(max_workers=8) as callers:
+                list(callers.map(call, range(8)))
+            assert len(posts) == 1
+            result, error, _ = managers[0]._run_with_timeout(lambda: "healthy", 1, "unrelated")
+            assert result == "healthy" and error is None
+        finally:
+            release.set()
+            for worker in posts:
+                worker.join(timeout=2)
+                assert not worker.is_alive()
+        assert len(posts) == 1  # No queued HTTP calls execute after their callers timed out.
+        assert managers[0].get_capital_flow_context("600519", budget_seconds=1)["data"]["stock_flow"]["main_net_inflow"] == 1e6
+
+    @pytest.mark.parametrize("active_kind", ["chip", "flow"])
+    @pytest.mark.parametrize("fresh_instance", [False, True])
+    def test_chip_and_flow_share_nonblocking_admission(self, monkeypatch, active_kind, fresh_instance):
+        from threading import Event, Thread
+
+        entered, release = Event(), Event()
+        posts, errors = [], []
+        fetcher = MiaoxiangFetcher(api_key="test-key", cache_ttl=0)
+        other = MiaoxiangFetcher(api_key="test-key", cache_ttl=0) if fresh_instance else fetcher
+        table = _make_table(["2026-08-21"], {"0": ["13.91"], "1": ["100万"]},
+                            {"0": "平均成本", "1": "主力净流入资金"})
+
+        def blocked_post(*args, **kwargs):
+            posts.append(kwargs["json"]["toolQuery"])
+            entered.set()
+            assert release.wait(timeout=5)
+            return _FakeResponse(_make_response([table]))
+
+        def active():
+            try:
+                getter = fetcher.get_chip_distribution if active_kind == "chip" else fetcher.get_capital_flow
+                getter("600519")
+            except Exception as exc:
+                errors.append(exc)
+
+        monkeypatch.setattr("data_provider.miaoxiang_fetcher.requests.post", blocked_post)
+        monkeypatch.setattr("data_provider.miaoxiang_fetcher.MX_MIN_REQUEST_INTERVAL_SECONDS", 0)
+        worker = Thread(target=active)
+        worker.start()
+        try:
+            assert entered.wait(timeout=2)
+            if active_kind == "chip":
+                payload = {"stock_flow": {}, "errors": []}
+                DataFetcherManager(fetchers=[other])._supplement_capital_flow_from_fetchers("600330", payload, 0.2)
+                assert payload["stock_flow"] == {}
+                assert any("仍在执行" in error for error in payload["errors"])
+            else:
+                with pytest.raises(DataFetchError, match="仍在执行"):
+                    other.get_chip_distribution("600330")
+            assert len(posts) == 1
+        finally:
+            release.set()
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+        assert errors == [] and len(posts) == 1
+        assert other.get_chip_distribution("600330").avg_cost == pytest.approx(13.91)
+
+    @pytest.mark.parametrize("fresh_manager", [False, True])
+    def test_timed_out_requests_do_not_queue_or_starve_other_work(self, monkeypatch, fresh_manager):
+        from threading import Event, current_thread
+        from types import SimpleNamespace
+
+        release = Event()
+        workers = []
+        http_calls = []
+        fetcher = MiaoxiangFetcher(api_key="test-key", cache_ttl=0)
+        manager = DataFetcherManager(fetchers=[fetcher])
+        original_getter = fetcher.get_capital_flow
+        table = _make_table(["2026-08-21"], {"0": ["100万"]}, ["主力净流入资金"])
+        # Keep this concurrency test independent of the separate nameMap defect.
+        table["nameMap"] = {"0": "主力净流入资金"}
+
+        def tracked_getter(code):
+            workers.append(current_thread())
+            return original_getter(code)
+
+        def blocked_post(*args, **kwargs):
+            http_calls.append(kwargs["json"]["toolQuery"])
+            assert release.wait(timeout=5), "test did not release the fake HTTP call"
+            return _FakeResponse(_make_response([table]))
+
+        monkeypatch.setattr(fetcher, "get_capital_flow", tracked_getter)
+        monkeypatch.setattr("data_provider.miaoxiang_fetcher.requests.post", blocked_post)
+        monkeypatch.setattr("data_provider.miaoxiang_fetcher.MX_MIN_REQUEST_INTERVAL_SECONDS", 0)
+
+        def supplement(target, code, budget=0.02):
+            payload = {"stock_flow": {}, "source_chain": [], "errors": []}
+            target._supplement_capital_flow_from_fetchers(code, payload, budget)
+            return payload
+
+        try:
+            for index in range(12):
+                target = DataFetcherManager(fetchers=[fetcher]) if fresh_manager else manager
+                assert supplement(target, str(600100 + index))["stock_flow"] == {}
+            assert len(workers) == 1
+            assert len(http_calls) == 1
+            result, error, _ = manager._run_with_timeout(lambda: "healthy", 1, "unrelated")
+            assert result == "healthy" and error is None
+
+            healthy = SimpleNamespace(
+                name="HealthyFlowFixture", priority=99, capital_flow_markets={"cn"},
+                get_capital_flow=lambda code: {"stock_flow": {"main_net_inflow": 2}},
+            )
+            alternate = DataFetcherManager(fetchers=[fetcher, healthy])
+            assert supplement(alternate, "600519", 0.2)["stock_flow"]["main_net_inflow"] == 2
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(timeout=2)
+                assert not worker.is_alive()
+
+        assert supplement(manager, "600519", 1)["stock_flow"]["main_net_inflow"] == 1_000_000
+        assert len(http_calls) == 2  # One abandoned call, then one fresh call after actual exit.
+
+    def test_cn_daily_route_skips_mx_before_calls_and_telemetry(self, monkeypatch):
+        from types import SimpleNamespace
+        import pandas as pd
+
+        calls = []
+        started = []
+        fetcher = MiaoxiangFetcher(api_key="test-key", priority=0)
+
+        def unsupported_daily(**kwargs):
+            calls.append(kwargs)
+            raise AssertionError("supplement-only provider entered daily route")
+
+        monkeypatch.setattr(fetcher, "get_daily_data", unsupported_daily)
+        monkeypatch.setattr("data_provider.base.record_provider_run_started", lambda **kwargs: started.append(kwargs))
+        monkeypatch.setattr("data_provider.base.record_provider_run", lambda **kwargs: None)
+        healthy = SimpleNamespace(name="CnDailyFixture", priority=1,
+                                  get_daily_data=lambda **kwargs: pd.DataFrame({"close": [10.0]}))
+        manager = DataFetcherManager(fetchers=[fetcher, healthy])
+        try:
+            frame, source = manager.get_daily_data("600519")
+            assert source == "CnDailyFixture" and not frame.empty
+            assert calls == []
+            assert [entry["provider"] for entry in started] == ["CnDailyFixture"]
+        finally:
+            DataFetcherManager.reset_daily_source_health()
+
+
+class TestListNameMapContract:
+    def test_chip_table_selection_and_rows_share_list_mapping(self, monkeypatch):
+        table = _make_table(["2026-08-21"], {"0": ["13.91"], "1": ["83.24%"]},
+                            ["平均成本", "获利比例"])
+        chip = _fetcher_with_response(monkeypatch, _make_response([table])).get_chip_distribution("001205")
+        assert chip.avg_cost == pytest.approx(13.91)
+        assert chip.profit_ratio == pytest.approx(0.8324)
+
+    def test_money_table_selection_and_rows_share_list_mapping(self, monkeypatch):
+        table = _make_table(["2026-08-21"], {"0": ["13.91"], "1": ["100万"]},
+                            ["收盘价", "主力净流入资金"])
+        flow = _fetcher_with_response(monkeypatch, _make_response([table])).get_capital_flow("001205")
+        assert flow["stock_flow"]["main_net_inflow"] == pytest.approx(1_000_000)
 
 
 class TestCapitalFlowColumnSelection:

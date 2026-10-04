@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+
+- [修复] 妙想补充查询采用跨实例/筹码与资金流共享的非阻塞准入及超时隔离，避免过期后台请求排队消耗额度；明确排除日线能力，并统一列表型 nameMap 的选表与解析。
 - [修复] 默认 Web smoke 排除独立 fixture 目录，避免无密码且未启动 Web 服务时错误收集选股用例；CI 同时验收默认和 fixture 入口。
 - [测试] 强化无理由 LLM 排序回归，验证双候选实际重排（含缺省和零分、risk-only 响应）后保留本地 observed 因子、模型 inferred 标记与 partial 综合质量。
 - [修复] 选股时点证据标题为空白但摘要有效时复用近期缓存，Why Now 展示有效摘要，避免误刷新和证据丢失。
