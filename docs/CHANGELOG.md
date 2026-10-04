@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 智能导入兼容带 UTF-8 BOM 的 CSV 与剪贴板文本，避免 `code` 表头被误当成数据并丢失有效股票代码。
 - [新功能] Agent 新增 FXMacroData 官方宏观数据工具；USD 基础数据无需密钥，`00-daily-analysis.yml` 已映射可选的 `FXMACRODATA_API_KEY` Secret；Windows/macOS 桌面构建收集客户端内置操作目录，并在冻结产物中校验 Agent 工具注册表。
 - [修复] 为 AkShare 大盘涨跌统计的东财与新浪降级调用增加可强制终止的子进程超时，避免外部接口无响应时长期占用分析线程（Fixes #2340）。
+- [新功能] 新增 Requesty（OpenAI Compatible 聚合网关）渠道预设：Web 模板、`.env.example` 示例、`00-daily-analysis.yml` 的 `LLM_REQUESTY_*` 映射与服务商文档同步补齐；`requesty.ai` Base URL 下「获取模型」返回的 vendor/model ID 自动保留 `openai/` 网关路由，避免被误判为 LiteLLM 直连 provider。
 
 - [修复] CLI 与 Web/API 每日调度共享 SQLite 计划时刻认领，避免同一数据库上的并发或错峰定时推送重复；保留不同时间点/分析范围及手动补跑，明确失败后的至多一次派发语义（Fixes #2349）。
 - [修复] 告警列表披露有效环境规则及后台去重后的数量，提示页面删除或禁用不会停用环境规则；保留原有加载、执行和通知语义。
