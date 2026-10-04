@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] Web Chat 意图识别层新增主解析器 `web_intent_resolver`（六步流水线，消费分词模块产物）：一条用户消息解析为按表达顺序保序的任务列表（`resolve` 返回二维组结构，组=子消息）；消息级多任务切分（消费型标点 + 顺序连接词，token 元素恒不变），同句平权分解（个股/泛市场·指数·纯市场词/板块/追问继承/存疑代码主体判定梯，未被主体消费的板块与组合语境独立成任务）；跨市场同名歧义聚合为 `confirm_stock` 确认（组级 pending：市场词/候选全名/唯一子串/裸数字逐组消解，点名市场词不串扰他组，矛盾回复整轮判新话题，拒绝词取消全链），任一任务待确认即整链短路；LLM 多意图兜底协议（`intents` 数组保序拆分、`followup` 伪标签转继承、`stock_code` 三道防幻觉闸门、板块/未解名"原文出现"闸门；豁免需视野完备+置信≥0.8+无多意图信号三证齐全）；会话簿记 `recent_stocks`/`pending_actions`/`last_intent`/`last_resolutions`（确认消费与跨轮追问继承的数据源）。意图枚举 `WebIntent`（五互斥意图 + 上下文继承）与任务结构 `WebIntentResolution` 随本 PR 落入 `web_intent_types`。
 - [测试] 新增 407 个意图解析器单元测试：三判别测试意图边界矩阵（与 `web_intent_types` docstring 对照表互为基线）、多意图切分与平权分解、确认消费完整生命周期（消歧/矛盾/拒绝/新话题/模糊回应）、LLM 合并闸门与坏输出回退、会话簿记与跨轮追问继承。
 
+- [修复] 妙想资金流按明确金额指标选表选列，防止收盘价或占比被误当作主力净流入金额；缺失值保留在交易日窗口中，避免较早数据被误当作最新值或完整窗口。
+
 - [修复] AkShare 基本面财务包、资金流和龙虎榜超时后，在真实后台任务结束前按操作跨管理器抑制重复请求，避免连续分析不断占用后台槽位；正常并发与其他数据块继续执行，任务退出后自动恢复。
 
 - [修复] 基本面请求诊断用单调时钟记录实际等待耗时，线程池拒绝和超时不再把完整超时预算写入 duration_ms。
@@ -91,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新增单票决策信号复盘摘要：只读接口 `GET /api/v1/decision-signals/stocks/{stock_code}/review` 返回低敏 ReviewMemory 契约（样本量、命中率、常见 miss 原因、置信度调整方向），样本不足、unable 率高或数据质量弱时固定为 observe 仅观察；`AGENT_MEMORY_ENABLED=true` 时 Agent 记忆以独立 section 注入该复盘摘要，flag 关闭时行为不变（#1903）
 
 - [修复] 将 litellm 依赖窗口上界收敛到 `<1.99.0`：1.99.0 起把 `prompt_cache_key` 透传给 OpenAI provider，破坏 provider 缓存测试对不透传行为的既有断言（CI backend-tests 3/3 与 backend-gate 失败）；保留历史最低版本与 `!=1.82.7`/`!=1.82.8` 事故排除，同时同步更新各 LLM 兼容文档中写死的依赖约束表述，避免文档与 requirements.txt 漂移
+- [新功能] 新增妙想（MX_API）补充数据源 `MX_APIKEY`/`MX_PRIORITY`：东财公开接口失败或限流时兜底获取筹码分布与个股资金流，补充调用受剩余阶段预算硬约束；已接线默认 GitHub Actions 工作流与 Web 设置注册表
 
 - [新功能] 新增 `SEARXNG_TIMEOUT_SECONDS` 配置自建 SearXNG 单次搜索超时（默认 10 秒），已接线全部 SearchService 构造入口（含题材搜索子进程重建）与默认 GitHub Actions 工作流
 
